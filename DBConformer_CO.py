@@ -18,7 +18,7 @@ import torch.optim as optim
 import pandas as pd
 from utils.network import backbone_net, backbone_net_deep, backbone_net_shallow, backbone_net_ifnet, \
     backbone_net_fbcnet, backbone_net_adfcnn, backbone_net_conformer, backbone_net_dbconformer, backbone_net_fbmsnet, \
-    backbone_net_ifmambanet
+    backbone_net_ifmambanet, backbone_net_mynet
 from utils.LogRecord import LogRecord
 from utils.dataloader import read_mi_within_tar
 from utils.utils import fix_random_seed, cal_acc_comb, data_loader, data_loader_within
@@ -51,10 +51,12 @@ def train_target(args):
         netF = backbone_net_conformer(args, return_type='xy')
     elif args.backbone == 'DBConformer':
         netF = backbone_net_dbconformer(args)
+    elif args.backbone == 'MyNet':
+        netF = backbone_net_mynet(args)
     elif args.backbone == 'FBMSNet':
         netF, netC = backbone_net_fbmsnet(args, return_type='xy')
     if args.data_env != 'local':
-        if args.backbone == 'FBCNet' or args.backbone == 'Conformer' or args.backbone == 'DBConformer':
+        if args.backbone == 'FBCNet' or args.backbone == 'Conformer' or args.backbone == 'DBConformer' or args.backbone == 'MyNet':
             netF = netF.cuda()
             base_network = netF
             optimizer_f = optim.Adam(netF.parameters(), lr=args.lr)
@@ -63,8 +65,19 @@ def train_target(args):
             base_network = nn.Sequential(netF, netC)
             optimizer_f = optim.Adam(netF.parameters(), lr=args.lr)
             optimizer_c = optim.Adam(netC.parameters(), lr=args.lr)
+    else:
+        if args.backbone == 'FBCNet' or args.backbone == 'Conformer' or args.backbone == 'DBConformer' or args.backbone == 'MyNet':
+            base_network = netF
+            optimizer_f = optim.Adam(netF.parameters(), lr=args.lr)
+        else:
+            base_network = nn.Sequential(netF, netC)
+            optimizer_f = optim.Adam(netF.parameters(), lr=args.lr)
+            optimizer_c = optim.Adam(netC.parameters(), lr=args.lr)
     if args.class_num == 2:
-        class_weight = torch.tensor([1., args.weight], dtype=torch.float32).cuda()  # class imbalance
+        if args.data_env != 'local':
+            class_weight = torch.tensor([1., args.weight], dtype=torch.float32).cuda()  # class imbalance
+        else:
+            class_weight = torch.tensor([1., args.weight], dtype=torch.float32)
         criterion = nn.CrossEntropyLoss(weight=class_weight)
     else:
         criterion = nn.CrossEntropyLoss()
@@ -89,11 +102,11 @@ def train_target(args):
         features_source, outputs_source = base_network(inputs_source)
         classifier_loss = criterion(outputs_source, labels_source)
         optimizer_f.zero_grad()
-        if args.backbone != 'FBCNet' and args.backbone != 'Conformer' and args.backbone != 'DBConformer':
+        if args.backbone != 'FBCNet' and args.backbone != 'Conformer' and args.backbone != 'DBConformer' and args.backbone != 'MyNet':
             optimizer_c.zero_grad()
         classifier_loss.backward()
         optimizer_f.step()
-        if args.backbone != 'FBCNet' and args.backbone != 'Conformer' and args.backbone != 'DBConformer':
+        if args.backbone != 'FBCNet' and args.backbone != 'Conformer' and args.backbone != 'DBConformer' and args.backbone != 'MyNet':
             optimizer_c.step()
 
         if iter_num % interval_iter == 0 or iter_num == max_iter:
@@ -126,7 +139,7 @@ def train_target(args):
 if __name__ == '__main__':
     cpu_num = 8
     torch.set_num_threads(cpu_num)
-    data_name_list = ['Zhou2016']  # 'BNCI2014001', 'BNCI2014004', 'Zhou2016', 'MI1-7', 'BNCI2014002'
+    data_name_list = ['BNCI2014001']  # 'BNCI2014001', 'BNCI2014004', 'Zhou2016', 'MI1-7', 'BNCI2014002'
     dct = pd.DataFrame(columns=['dataset', 'avg', 'std', 's0', 's1', 's2', 's3', 's4', 's5', 's6', 's7', 's8', 's9', 's10', 's11', 's12', 's13'])
     for data_name in data_name_list:
         weight = 1
@@ -150,14 +163,14 @@ if __name__ == '__main__':
                                   N=N, chn=chn, class_num=class_num, paradigm=paradigm, data_name=data_name,
                                   F1=F1, D=D, F2=F2, weight=weight)
 
-        args.backbone = 'DBConformer'  # DBConformer (Ours)
+        args.backbone = 'MyNet'  # DBConformer (Ours)
         args.method = args.backbone + '_' + data_name
         # DBConformer parameters
         args.gate_flag = False   # Default False, reduce performance
         args.posemb_flag = True   # Default True, enhance performance
         args.chn_atten_flag = True  # Default True
         args.branch = 'all'  # [all, temporal]
-        if args.backbone == 'DBConformer':
+        if args.backbone == 'DBConformer' or args.backbone == 'MyNet':
             args.emb_size = 40
             args.spa_dim = 16
             if data_name == 'BNCI2014002':
@@ -174,7 +187,7 @@ if __name__ == '__main__':
         args.align = True
         args.dropoutRate = 0.25
         # learning rate
-        args.lr = 0.0001
+        args.lr = 0.001
         # batch size
         args.batch_size = 32
         # training epochs

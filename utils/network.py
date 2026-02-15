@@ -13,7 +13,7 @@ from models.EEGNet import EEGNet_feature, EEGNet
 from models.FC import FC, FC_xy, FC_wave, FC_wave_xy, FC_xy_2l
 from models.DeepConvNet import DeepConvNet
 from models.ShallowConvNet import ShallowConvNet
-from models.ShallowConvNet_V2 import ShallowConvNetV2
+# from models.ShallowConvNet_V2 import ShallowConvNetV2
 from models.EEGNeX import EEGNeX
 from models.IFNetV2 import IFNet  # IFNetV2
 from models.FBCNet import FBCNet
@@ -21,11 +21,12 @@ from models.ADFCNN import ADFCNN
 from models.Conformer import Conformer
 from models.FBMSNet import FBMSNet
 from models.DBConformer import DBConformer
-from models.DBConformer_V2 import DBConformerV2
+# from models.DBConformer_V2 import DBConformerV2
 from models.CTNet import CTNet
+from models.MyNet import MyNet
 
 
-from models.IFMambaNet import IFMambaNet
+# from models.IFMambaNet import IFMambaNet
 
 
 
@@ -124,6 +125,10 @@ def backbone_net_conformer(args, return_type='xy'):
 
 def backbone_net_dbconformer(args):
     netF = DBConformer(args, emb_size=args.emb_size, tem_depth=args.transformer_depth_tem, chn_depth=args.transformer_depth_chn, chn=args.chn, n_classes=args.class_num)  # TODO
+    return netF
+
+def backbone_net_mynet(args):
+    netF = MyNet(args, emb_size=args.emb_size, tem_depth=args.transformer_depth_tem, chn_depth=args.transformer_depth_chn, chn=args.chn, n_classes=args.class_num)
     return netF
 
 def backbone_net_dbconformer_plot(args):

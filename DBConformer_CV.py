@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.optim as optim
 import pandas as pd
 from utils.network import backbone_net, backbone_net_deep, backbone_net_shallow, backbone_net_ifnet, \
-    backbone_net_fbcnet, backbone_net_adfcnn, backbone_net_conformer, backbone_net_dbconformer
+    backbone_net_fbcnet, backbone_net_adfcnn, backbone_net_conformer, backbone_net_dbconformer, backbone_net_mynet
 from utils.LogRecord import LogRecord
 from utils.dataloader import read_mi_within_tar_CV
 from utils.utils import fix_random_seed, cal_acc_comb, data_loader_within
@@ -57,8 +57,10 @@ def train_target(args):
             netF = backbone_net_conformer(args)
         elif args.backbone == 'DBConformer':
             netF = backbone_net_dbconformer(args)
+        elif args.backbone == 'MyNet':
+            netF = backbone_net_mynet(args)
         if args.data_env != 'local':
-            if args.backbone == 'FBCNet' or args.backbone == 'Conformer' or args.backbone == 'DBConformer':
+            if args.backbone == 'FBCNet' or args.backbone == 'Conformer' or args.backbone == 'DBConformer' or args.backbone == 'MyNet':
                 netF = netF.cuda()
                 base_network = netF
                 optimizer_f = optim.Adam(netF.parameters(), lr=args.lr)
@@ -86,17 +88,17 @@ def train_target(args):
             if inputs_source.size(0) == 1:
                 continue
             iter_num += 1
-            if 'ADFCNN' in args.backbone or 'Conformer' in args.backbone or args.backbone == 'DBConformer':
+            if 'ADFCNN' in args.backbone or 'Conformer' in args.backbone or args.backbone == 'DBConformer' or args.backbone == 'MyNet':
                 inputs_source = inputs_source.unsqueeze_(3)
                 inputs_source = inputs_source.permute(0, 3, 1, 2)
             features_source, outputs_source = base_network(inputs_source)
             classifier_loss = criterion(outputs_source, labels_source)
             optimizer_f.zero_grad()
-            if args.backbone != 'FBCNet' and args.backbone != 'Conformer' and args.backbone != 'DBConformer':
+            if args.backbone != 'FBCNet' and args.backbone != 'Conformer' and args.backbone != 'DBConformer' and args.backbone != 'MyNet':
                 optimizer_c.zero_grad()
             classifier_loss.backward()
             optimizer_f.step()
-            if args.backbone != 'FBCNet' and args.backbone != 'Conformer' and args.backbone != 'DBConformer':
+            if args.backbone != 'FBCNet' and args.backbone != 'Conformer' and args.backbone != 'DBConformer' and args.backbone != 'MyNet':
                 optimizer_c.step()
             if iter_num % interval_iter == 0 or iter_num == max_iter:
                 base_network.eval()
@@ -156,7 +158,7 @@ if __name__ == '__main__':
         args.posemb_flag = True
         args.chn_atten_flag = True
         args.branch = 'all'  # [all, temporal]
-        if args.backbone == 'DBConformer':
+        if args.backbone == 'DBConformer' or args.backbone == 'MyNet':
             args.emb_size = 40
             args.transformer_depth_tem = 2
             args.transformer_depth_chn = 2
