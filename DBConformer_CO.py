@@ -168,7 +168,8 @@ if __name__ == '__main__':
         # DBConformer parameters
         args.gate_flag = False   # Default False, reduce performance
         args.posemb_flag = True   # Default True, enhance performance
-        args.chn_atten_flag = True  # Default True
+        args.chn_atten_flag = False  # Default True
+        args.tcn_flag = True
         args.branch = 'all'  # [all, temporal]
         if args.backbone == 'DBConformer' or args.backbone == 'MyNet':
             args.emb_size = 40

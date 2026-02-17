@@ -16,6 +16,9 @@ from torch import nn
 from torch import Tensor
 from einops import rearrange
 from torch.backends import cudnn
+
+from models.modules import CausalConv1d, Conv1dWithConstraint
+
 cudnn.benchmark = False
 cudnn.deterministic = True
 
@@ -303,7 +306,7 @@ class Gate_FC(nn.Sequential):
         return out
 
 
-class DBConformer(nn.Module):
+class MyNet(nn.Module):
     def __init__(self, args, emb_size=40, tem_depth=5, chn_depth=5, chn=22, n_classes=2):
         super().__init__()
 
@@ -325,7 +328,7 @@ class DBConformer(nn.Module):
         self.posemb_flag = args.posemb_flag  # Default True
         self.branch = args.branch  # Default 'all', options=[all, temporal]
         self.chn_atten_flag = args.chn_atten_flag  # Default True
-
+        self.tcn_flag = args.tcn_flag
         if args.posemb_flag:
             self.pos_embedding_temporal = nn.Parameter(torch.randn(1, self.P, self.D))
             self.pos_embedding_spatial = nn.Parameter(torch.randn(1, self.C, self.D))
@@ -345,6 +348,14 @@ class DBConformer(nn.Module):
                     nn.Tanh(),
                     nn.Linear(emb_size, 1),  # D → 1 (score per channel)
                 )
+        self.tcn_head = TCNHead(
+            d_features=30,
+            n_groups=1,
+            tcn_depth=2,
+            kernel_length=4,
+            dropout_tcn=0.5,
+            n_classes=n_classes
+        )
     def forward(self, x):  # x: (B, 1, C, T)
         x = x.squeeze(1)  # → (B, C, T)
         x_embed = self.embedding(x)  # → (B, P, D)
@@ -378,6 +389,12 @@ class DBConformer(nn.Module):
                     attn_weights = torch.softmax(attn_scores, dim=1)  # (B, C, 1)
                     x_s = torch.sum(attn_weights * x_spatial, dim=1)  # (B, D)
                     x_fused = torch.cat([x_t, x_s], dim=-1)  # → (B, 2*D)
+                elif self.tcn_flag:
+                    x_fused = torch.cat([x_temporal, x_spatial], dim=1)  # (B, P+C, D)
+                    # x_fused = x_fused.transpose(1, 2)  # (B, D, P+C) for TCN input
+                    out = self.tcn_head(x_fused)  # (B, n_classes)
+                    # x_fused = x_fused.mean(dim=-1)  # (B, D) for return consistency
+                    return x_fused, out
                 else:
                     # Mean pooling
                     x_fused = torch.cat([
@@ -386,3 +403,115 @@ class DBConformer(nn.Module):
                     ], dim=-1)  # → (B, 2*D)
             _, out = self.classifier(x_fused)  # out: (B, n_classes)
         return x_fused, out
+
+class TCNHead(nn.Module):
+    def __init__(self, d_features: int = 64, n_groups: int = 1, tcn_depth: int = 2,
+                 kernel_length: int = 4, dropout_tcn: float = 0.3, n_classes: int = 4):
+        super().__init__()
+        self.n_groups = n_groups
+        self.n_classes = n_classes
+        self.tcn = TCN(tcn_depth, kernel_length, d_features, n_groups, dropout_tcn)
+
+        # self.linear = Conv1dWithConstraint(d_model, n_classes*n_groups, kernel_size=1,
+        #                                         groups=n_groups, max_norm=0.25)
+        self.classifier = ClassificationHeadTCN(
+            d_features=d_features,
+            n_groups=n_groups,
+            n_classes=n_classes,
+        )
+
+    def forward(self, x):
+        x = self.tcn(x)
+        x = x[:, :, -1:]
+
+        x = self.classifier(x)  # (B, n_classes)
+        # tcn_out = self.linear(tcn_out).squeeze(-1)
+
+        # tcn_out = tcn_out.view(x.shape[0], self.n_groups, self.n_classes)
+        # tcn_out = tcn_out.mean(dim=1)
+
+        return x
+
+
+class TCN(nn.Module):
+    def __init__(self, depth: int = 2, kernel_length: int = 4, n_filters: int = 32,
+                 n_groups: int = 1, dropout: float = 0.3):
+        super(TCN, self).__init__()
+        self.blocks = nn.ModuleList()
+        for i in range(depth):
+            dilation = 2 ** i
+            self.blocks.append(TCNBlock(kernel_length, n_filters, dilation, n_groups, dropout))
+
+    def forward(self, x):
+        for blk in self.blocks:
+            x = blk(x)
+        return x
+
+
+class TCNBlock(nn.Module):
+    def __init__(self, kernel_length: int = 4, n_filters: int = 32, dilation: int = 1,
+                 n_groups: int = 1, dropout: float = 0.3):
+        super().__init__()
+        self.conv1 = CausalConv1d(n_filters, n_filters, kernel_size=kernel_length,
+                                  dilation=dilation, groups=n_groups)
+        self.bn1 = nn.BatchNorm1d(n_filters)
+        self.nonlinearity1 = nn.ELU()
+        self.drop1 = nn.Dropout(dropout)
+
+        self.conv2 = CausalConv1d(n_filters, n_filters, kernel_size=kernel_length,
+                                  dilation=dilation, groups=n_groups)
+        self.bn2 = nn.BatchNorm1d(n_filters)
+        self.nonlinearity2 = nn.ELU()
+        self.drop2 = nn.Dropout(dropout)
+
+        self.nonlinearity3 = nn.ELU()
+
+        nn.init.constant_(self.conv1.bias, 0.0)
+        nn.init.constant_(self.conv2.bias, 0.0)
+
+    def forward(self, input):
+        x = self.drop1(self.nonlinearity1(self.bn1(self.conv1(input))))
+        x = self.drop2(self.nonlinearity2(self.bn2(self.conv2(x))))
+        x = self.nonlinearity3(input + x)
+        return x
+
+class ClassificationHeadTCN(nn.Module):
+    """
+    Maps TCN features to class logits and optionally averages across groups.
+    Expected input shape: (batch, d_model, 1)   ← after time-step selection.
+    Output shape:        (batch, n_classes)
+    """
+    def __init__(
+        self,
+        d_features: int,
+        n_groups: int,
+        n_classes: int,
+        kernel_size: int = 1,
+        max_norm: float = 0.25,
+    ):
+        super().__init__()
+        self.n_groups   = n_groups
+        self.n_classes  = n_classes
+
+        # self.drop = nn.Dropout(0.3)
+
+        # point-wise (1 × 1) grouped conv = class projection per group
+        self.linear = Conv1dWithConstraint(
+            in_channels=d_features,
+            out_channels=n_classes * n_groups,
+            kernel_size=kernel_size,
+            groups=n_groups,
+            max_norm=max_norm,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, d_model, Tc)  →  logits: (B, n_classes)
+        """
+        # (B, n_classes*n_groups, 1) → squeeze last dim
+        # x = self.drop(x)
+        x = self.linear(x).squeeze(-1)
+
+        # (B, n_groups, n_classes) → mean over groups
+        x = x.view(x.size(0), self.n_groups, self.n_classes).mean(dim=1)
+        return x
