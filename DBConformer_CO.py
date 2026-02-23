@@ -192,7 +192,7 @@ if __name__ == '__main__':
         # batch size
         args.batch_size = 32
         # training epochs
-        args.max_epoch = 200
+        args.max_epoch = 100
         # GPU device id
         try:
             device_id = str(sys.argv[1])

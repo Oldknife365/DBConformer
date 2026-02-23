@@ -131,29 +131,50 @@ class CrossAttention(nn.Module):
         super().__init__()
         self.emb_size = emb_size
         self.num_heads = num_heads
+        self.head_dim = emb_size // num_heads
+        
+        # 检查emb_size是否能被num_heads整除
+        assert emb_size % num_heads == 0, "emb_size必须能被num_heads整除"
+        
         self.query_proj = nn.Linear(emb_size, emb_size)
         self.key_proj = nn.Linear(emb_size, emb_size)
         self.value_proj = nn.Linear(emb_size, emb_size)
         self.out_proj = nn.Linear(emb_size, emb_size)
         self.dropout = nn.Dropout(dropout)
+        
+        # 正确的缩放因子
+        self.scale = self.head_dim ** -0.5
 
     def forward(self, query, key_value):  # query: (B, P1, D), key_value: (B, P2, D)
+        # 保存原始query用于残差连接
+        residual = query
+        
         Q = self.query_proj(query)
         K = self.key_proj(key_value)
         V = self.value_proj(key_value)
 
-        Q = rearrange(Q, 'b n (h d) -> b h n d', h=self.num_heads)
-        K = rearrange(K, 'b n (h d) -> b h n d', h=self.num_heads)
-        V = rearrange(V, 'b n (h d) -> b h n d', h=self.num_heads)
+        # 重新排列维度以适应多头注意力
+        Q = rearrange(Q, 'b q (h d) -> b h q d', h=self.num_heads, d=self.head_dim)
+        K = rearrange(K, 'b k (h d) -> b h k d', h=self.num_heads, d=self.head_dim)
+        V = rearrange(V, 'b k (h d) -> b h k d', h=self.num_heads, d=self.head_dim)
 
-        attn_scores = torch.einsum('bhqd, bhkd -> bhqk', Q, K) / (self.emb_size ** 0.5)
+        # 计算注意力分数，使用正确的缩放因子
+        attn_scores = torch.einsum('bhqd, bhkd -> bhqk', Q, K) * self.scale
         attn_probs = F.softmax(attn_scores, dim=-1)
         attn_probs = self.dropout(attn_probs)
 
+        # 应用注意力权重
         out = torch.einsum('bhqk, bhvd -> bhqd', attn_probs, V)
-        out = rearrange(out, 'b h n d -> b n (h d)')
+        
+        # 重新排列回原始形状
+        out = rearrange(out, 'b h q d -> b q (h d)')
+        
+        # 输出投影
         out = self.out_proj(out)
-
+        
+        # 添加残差连接
+        out = out + residual
+        
         return out
 
 
@@ -335,7 +356,7 @@ class MyNet(nn.Module):
 
         self.temporal_transformer = TransformerEncoder(tem_depth, emb_size)
         self.spatial_transformer = TransformerEncoder(chn_depth, emb_size)
-        # self.cross_attn = CrossAttention(emb_size=emb_size, num_heads=4)  # cross-attention (bad performance)
+        self.cross_attn = CrossAttention(emb_size=emb_size, num_heads=4)  # cross-attention for temporal-spatial fusion
         if args.gate_flag or self.branch == 'temporal' or self.branch == 'spatial':
             self.gate_fc = Gate_FC(emb_size)  # dual-branch weighting aggregation
             self.classifier = ClassificationHead(emb_size, n_classes)
@@ -368,6 +389,10 @@ class MyNet(nn.Module):
         x_temporal = self.temporal_transformer(x_embed)  # (B, P, D)
         # Spatial Transformer (attention over channels interpreted as tokens)
         x_spatial = self.spatial_transformer(x_embed_spatial)  # (B, C, D)
+        
+        # Cross attention between temporal and spatial features
+        x_temporal_attended = self.cross_attn(x_temporal, x_spatial)  # (B, P, D)
+        x_spatial_attended = self.cross_attn(x_spatial, x_temporal)   # (B, C, D)
 
         if self.branch == 'temporal':
             x_fused = x_temporal.mean(dim=1)
@@ -390,8 +415,8 @@ class MyNet(nn.Module):
                     x_s = torch.sum(attn_weights * x_spatial, dim=1)  # (B, D)
                     x_fused = torch.cat([x_t, x_s], dim=-1)  # → (B, 2*D)
                 elif self.tcn_flag:
-                    x_fused = torch.cat([x_temporal, x_spatial], dim=1)  # (B, P+C, D)
-                    # x_fused = x_fused.transpose(1, 2)  # (B, D, P+C) for TCN input
+                    # Use cross-attended features for TCN
+                    x_fused = torch.cat([x_temporal_attended, x_spatial_attended], dim=1)  # (B, P+C, D)
                     out = self.tcn_head(x_fused)  # (B, n_classes)
                     # x_fused = x_fused.mean(dim=-1)  # (B, D) for return consistency
                     return x_fused, out
