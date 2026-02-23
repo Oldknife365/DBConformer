@@ -18,6 +18,7 @@ from einops import rearrange
 from torch.backends import cudnn
 
 from models.modules import CausalConv1d, Conv1dWithConstraint
+import math
 
 cudnn.benchmark = False
 cudnn.deterministic = True
@@ -52,7 +53,7 @@ class InterFre(nn.Module):
 
 
 class Stem(nn.Module):
-    def __init__(self, data_name, in_planes, out_planes = 64, kernel_size=63, patch_size=125, radix=2):
+    def __init__(self, data_name, in_planes, out_planes=64, kernel_size=63, patch_size=125, radix=2):
         nn.Module.__init__(self)
         self.in_planes = in_planes
         self.out_planes = out_planes
@@ -61,12 +62,13 @@ class Stem(nn.Module):
         self.radix = radix
         self.data_name = data_name
 
-        self.sconv = Conv(nn.Conv1d(self.in_planes, self.mid_planes, 1, bias=False, groups = radix),
+        self.sconv = Conv(nn.Conv1d(self.in_planes, self.mid_planes, 1, bias=False, groups=radix),
                           bn=nn.BatchNorm1d(self.mid_planes), activation=None)
 
         self.tconv = nn.ModuleList()
         for _ in range(self.radix):
-            self.tconv.append(Conv(nn.Conv1d(self.out_planes, self.out_planes, kernel_size, 1, groups=self.out_planes, padding=kernel_size // 2, bias=False,),
+            self.tconv.append(Conv(nn.Conv1d(self.out_planes, self.out_planes, kernel_size, 1, groups=self.out_planes,
+                                             padding=kernel_size // 2, bias=False, ),
                                    bn=nn.BatchNorm1d(self.out_planes), activation=None))
             kernel_size //= 2
 
@@ -121,9 +123,28 @@ class PatchEmbeddingTemporal(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x):  # x: (B, C, T)
-        out = self.stem(x)         # (B, D, P)
-        out = out.permute(0, 2, 1) # → (B, P, D)
+        out = self.stem(x)  # (B, D, P)
+        out = out.permute(0, 2, 1)  # → (B, P, D)
         return out
+
+
+class ECA(nn.Module):
+    """Efficient Channel Attention"""
+    def __init__(self, channels, gamma=2, b=1):
+        super(ECA, self).__init__()
+        # 根据通道数自动计算卷积核大小
+        t = int(abs(math.log(channels, 2) + b) / gamma)
+        k_size = t if t % 2 else t + 1
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # x shape: (B, C, T)
+        y = self.avg_pool(x)  # (B, C, 1)
+        y = self.conv(y.transpose(-1, -2)).transpose(-1, -2)  # (B, C, 1)
+        y = self.sigmoid(y)  # (B, C, 1)
+        return x * y.expand_as(x)  # (B, C, T)
 
 
 class CrossAttention(nn.Module):
@@ -132,23 +153,23 @@ class CrossAttention(nn.Module):
         self.emb_size = emb_size
         self.num_heads = num_heads
         self.head_dim = emb_size // num_heads
-        
+
         # 检查emb_size是否能被num_heads整除
         assert emb_size % num_heads == 0, "emb_size必须能被num_heads整除"
-        
+
         self.query_proj = nn.Linear(emb_size, emb_size)
         self.key_proj = nn.Linear(emb_size, emb_size)
         self.value_proj = nn.Linear(emb_size, emb_size)
         self.out_proj = nn.Linear(emb_size, emb_size)
         self.dropout = nn.Dropout(dropout)
-        
+
         # 正确的缩放因子
         self.scale = self.head_dim ** -0.5
 
     def forward(self, query, key_value):  # query: (B, P1, D), key_value: (B, P2, D)
         # 保存原始query用于残差连接
         residual = query
-        
+
         Q = self.query_proj(query)
         K = self.key_proj(key_value)
         V = self.value_proj(key_value)
@@ -165,21 +186,22 @@ class CrossAttention(nn.Module):
 
         # 应用注意力权重
         out = torch.einsum('bhqk, bhvd -> bhqd', attn_probs, V)
-        
+
         # 重新排列回原始形状
         out = rearrange(out, 'b h q d -> b q (h d)')
-        
+
         # 输出投影
         out = self.out_proj(out)
-        
+
         # 添加残差连接
         out = out + residual
-        
+
         return out
 
 
 class SEBlock(nn.Module):
     """bad performance"""
+
     def __init__(self, in_channels, reduction=16):
         super(SEBlock, self).__init__()
         self.fc = nn.Sequential(
@@ -214,6 +236,7 @@ class PatchEmbeddingSpatial(nn.Module):
         x = self.encoder(x)        # → (B*C, emb_size)
         x = x.view(B, C, -1)       # → (B, C, emb_size)
         return x
+
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, emb_size, num_heads, dropout):
@@ -316,6 +339,7 @@ class ClassificationHead(nn.Sequential):
         out = self.fc(x)
         return x, out
 
+
 class Gate_FC(nn.Sequential):
     def __init__(self, emb_size):
         super().__init__()
@@ -367,7 +391,7 @@ class MyNet(nn.Module):
                 self.spatial_attn_pool = nn.Sequential(
                     nn.Linear(emb_size, emb_size),  # D → D
                     nn.Tanh(),
-                    nn.Linear(emb_size, 1),  # D → 1 (score per channel)
+                    nn.Linear(emb_size, 1),  # D → 1 (score per channel),
                 )
         self.tcn_head = TCNHead(
             d_features=30,
@@ -377,9 +401,24 @@ class MyNet(nn.Module):
             dropout_tcn=0.5,
             n_classes=n_classes
         )
+
     def forward(self, x):  # x: (B, 1, C, T)
         x = x.squeeze(1)  # → (B, C, T)
-        x_embed = self.embedding(x)  # → (B, P, D)
+
+        # 正常顺序的embedding
+        x_embed_normal = self.embedding(x)  # → (B, P, D)
+
+        # 时间逆序的embedding
+        x_reversed = torch.flip(x, dims=[-1])  # 时间维度逆序 (B, C, T)
+        x_embed_reversed = self.embedding(x_reversed)  # → (B, P, D)
+
+        # 通过cross attention融合正序和逆序特征
+        x_fused_forward = self.cross_attn(x_embed_normal, x_embed_reversed)  # (B, P, D)
+        x_fused_backward = self.cross_attn(x_embed_reversed, x_embed_normal)  # (B, P, D)
+
+        # 相加融合结果
+        x_embed = x_fused_forward + x_fused_backward  # (B, P, D)
+
         x_embed_spatial = self.channel_embedding(x)  # (B, C, D)
         if self.posemb_flag:
             x_embed = x_embed + self.pos_embedding_temporal  # temporal positional encoding
@@ -389,10 +428,10 @@ class MyNet(nn.Module):
         x_temporal = self.temporal_transformer(x_embed)  # (B, P, D)
         # Spatial Transformer (attention over channels interpreted as tokens)
         x_spatial = self.spatial_transformer(x_embed_spatial)  # (B, C, D)
-        
+
         # Cross attention between temporal and spatial features
         x_temporal_attended = self.cross_attn(x_temporal, x_spatial)  # (B, P, D)
-        x_spatial_attended = self.cross_attn(x_spatial, x_temporal)   # (B, C, D)
+        x_spatial_attended = self.cross_attn(x_spatial, x_temporal)  # (B, C, D)
 
         if self.branch == 'temporal':
             x_fused = x_temporal.mean(dim=1)
@@ -428,6 +467,7 @@ class MyNet(nn.Module):
                     ], dim=-1)  # → (B, 2*D)
             _, out = self.classifier(x_fused)  # out: (B, n_classes)
         return x_fused, out
+
 
 class TCNHead(nn.Module):
     def __init__(self, d_features: int = 64, n_groups: int = 1, tcn_depth: int = 2,
@@ -500,23 +540,25 @@ class TCNBlock(nn.Module):
         x = self.nonlinearity3(input + x)
         return x
 
+
 class ClassificationHeadTCN(nn.Module):
     """
     Maps TCN features to class logits and optionally averages across groups.
     Expected input shape: (batch, d_model, 1)   ← after time-step selection.
     Output shape:        (batch, n_classes)
     """
+
     def __init__(
-        self,
-        d_features: int,
-        n_groups: int,
-        n_classes: int,
-        kernel_size: int = 1,
-        max_norm: float = 0.25,
+            self,
+            d_features: int,
+            n_groups: int,
+            n_classes: int,
+            kernel_size: int = 1,
+            max_norm: float = 0.25,
     ):
         super().__init__()
-        self.n_groups   = n_groups
-        self.n_classes  = n_classes
+        self.n_groups = n_groups
+        self.n_classes = n_classes
 
         # self.drop = nn.Dropout(0.3)
 
